@@ -1,5 +1,11 @@
 name: Claude PR Review
 
+# 👇 Add this block for permissions
+permissions:
+  contents: read         # allows checkout
+  pull-requests: write   # allows posting PR comments
+  issues: write          # allows creating PR comments
+
 on:
   pull_request:
     types: [opened, synchronize]
