@@ -6,15 +6,27 @@ on:
 
 jobs:
   review:
+    # Prevent secrets from running on forked PRs (safe for public repos)
+    if: github.event.pull_request.head.repo.fork == false
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Required for full diff
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20  # Node 20+ has fetch built-in
 
       - name: Get PR Diff
         run: |
           git fetch origin ${{ github.base_ref }}
           git diff origin/${{ github.base_ref }} > pr.diff
+          echo "Diff size:"
+          wc -c pr.diff
 
       - name: Ask Claude to review
         env:
@@ -22,40 +34,58 @@ jobs:
         run: |
           node << 'EOF'
           const fs = require("fs");
-          const axios = require("axios");
 
-          const diff = fs.readFileSync("pr.diff", "utf8");
+          async function main() {
+            const diff = fs.readFileSync("pr.diff", "utf8");
 
-          async function review() {
-            const response = await axios.post(
-              "https://api.anthropic.com/v1/messages",
-              {
-                model: "claude-3-5-sonnet-latest",
-                max_tokens: 1500,
-                messages: [
-                  {
-                    role: "user",
-                    content: `You are a senior engineer. Review this PR diff and provide structured feedback:\n\n${diff}`
-                  }
-                ]
-              },
-              {
-                headers: {
-                  "x-api-key": process.env.ANTHROPIC_API_KEY,
-                  "anthropic-version": "2023-06-01",
-                  "content-type": "application/json"
+            if (!diff.trim()) {
+              fs.writeFileSync("review.txt", "No changes detected in diff.");
+              return;
+            }
+
+            const body = JSON.stringify({
+              model: "claude-3-5-sonnet-latest",
+              max_tokens: 1500,
+              messages: [
+                {
+                  role: "user",
+                  content: `You are a senior software engineer.\n\nReview this GitHub PR diff and provide concise, actionable feedback.\n\nPR DIFF:\n${diff}`
                 }
-              }
-            );
+              ]
+            });
 
-            const reviewText = response.data.content[0].text;
+            const response = await fetch("https://api.anthropic.com/v1/messages", {
+              method: "POST",
+              headers: {
+                "x-api-key": process.env.ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+              },
+              body: body
+            });
+
+            if (!response.ok) {
+              const errorText = await response.text();
+              throw new Error("Claude API error: " + errorText);
+            }
+
+            const data = await response.json();
+
+            if (!data.content || !data.content.length) {
+              throw new Error("Invalid Claude response");
+            }
+
+            const reviewText = data.content[0].text;
+
             fs.writeFileSync("review.txt", reviewText);
           }
 
-          review();
+          main().catch(err => {
+            console.error(err);
+            process.exit(1);
+          });
           EOF
 
-      # 👇 STEP 3 GOES HERE
       - name: Post Claude Review as PR Comment
         uses: actions/github-script@v7
         with:
@@ -63,7 +93,7 @@ jobs:
             const fs = require('fs');
             const review = fs.readFileSync('review.txt', 'utf8');
 
-            github.rest.issues.createComment({
+            await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
