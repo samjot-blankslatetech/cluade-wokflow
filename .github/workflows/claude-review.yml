@@ -85,7 +85,7 @@ jobs:
       - name: Create Claude Script
         if: env.SKIP_REVIEW != 'true'
         run: |
-          cat > claude.js << 'SCRIPT'
+          cat > claude.cjs << 'SCRIPT'
           const fs = require("fs");
 
           // Split diff into per-file sections, trim each, and respect a total char budget
@@ -201,7 +201,7 @@ jobs:
           TOTAL_FILES: ${{ env.TOTAL_FILES }}
           REVIEWED_FILES: ${{ env.REVIEWED_FILES }}
           DIFF_TRUNCATED: ${{ env.DIFF_TRUNCATED }}
-        run: node claude.js
+        run: node claude.cjs
 
       - name: Post Claude Response
         if: env.SKIP_REVIEW != 'true'
