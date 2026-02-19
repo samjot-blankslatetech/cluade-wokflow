@@ -1,6 +1,5 @@
-name: Claude PR Review
+name: Claude PR Assistant
 
-# 👇 Workflow permissions
 permissions:
   contents: read
   pull-requests: write
@@ -9,93 +8,222 @@ permissions:
 on:
   pull_request:
     types: [opened, synchronize]
+  issue_comment:
+    types: [created]
 
 jobs:
-  review:
-    if: github.event.pull_request.head.repo.fork == false
+  claude:
     runs-on: ubuntu-latest
 
+    # Only run on non-fork PRs, or PR comments that @mention claude
+    if: |
+      (
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.fork == false
+      ) ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request != null &&
+        contains(github.event.comment.body, '@claude')
+      )
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Get PR Diff
+      - name: Set Mode
+        run: |
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            echo "MODE=comment" >> $GITHUB_ENV
+          else
+            echo "MODE=review" >> $GITHUB_ENV
+          fi
+
+      # Build a token-efficient filtered diff (review mode only)
+      - name: Build Filtered Diff
+        if: env.MODE == 'review'
         run: |
           git fetch origin ${{ github.base_ref }}
-          git diff origin/${{ github.base_ref }} > pr.diff
-          echo "Diff size:"
-          wc -c pr.diff
 
-      - name: Ask Claude to review
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # All changed files
+          git diff --name-only origin/${{ github.base_ref }} > all_files.txt
+          TOTAL=$(wc -l < all_files.txt | tr -d ' ')
+          echo "TOTAL_FILES=$TOTAL" >> $GITHUB_ENV
+
+          # Strip files that add noise / tokens without value:
+          # lock files, minified assets, source maps, generated code, build output
+          grep -vE \
+            "(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb|composer\.lock|Gemfile\.lock|poetry\.lock|Cargo\.lock|\.min\.(js|css)$|\.map$|\.snap$|\.pb\.go$|\.generated\.|_generated\.|\.d\.ts$|^(dist|build|out|\.next|\.nuxt|\.expo|vendor|node_modules|__pycache__)\/)" \
+            all_files.txt > filtered_files.txt || true
+
+          # Cap reviewed files to control max token spend
+          head -20 filtered_files.txt > review_files.txt
+          REVIEWED=$(wc -l < review_files.txt | tr -d ' ')
+          echo "REVIEWED_FILES=$REVIEWED" >> $GITHUB_ENV
+
+          if [ "$REVIEWED" -eq 0 ]; then
+            echo "SKIP_REVIEW=true" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          # Build diff only for selected files
+          while IFS= read -r file; do
+            [ -f "$file" ] && git diff origin/${{ github.base_ref }} -- "$file" 2>/dev/null
+          done < review_files.txt > pr.diff
+
+          # Hard cap at 100 KB — keeps prompt tokens reasonable for any PR size
+          if [ "$(wc -c < pr.diff)" -gt 102400 ]; then
+            head -c 102400 pr.diff > pr.diff.tmp && mv pr.diff.tmp pr.diff
+            echo "DIFF_TRUNCATED=true" >> $GITHUB_ENV
+          fi
+
+      - name: Create Claude Script
+        if: env.SKIP_REVIEW != 'true'
         run: |
-          node << 'EOF'
+          cat > claude.js << 'SCRIPT'
           const fs = require("fs");
 
-          async function main() {
-            const diff = fs.readFileSync("pr.diff", "utf8");
-
-            if (!diff.trim()) {
-              fs.writeFileSync("review.txt", "No changes detected in diff.");
-              return;
+          // Split diff into per-file sections, trim each, and respect a total char budget
+          function trimDiff(raw, totalBudget = 80000, perFileBudget = 12000) {
+            const sections = raw.split(/(?=^diff --git)/m).filter(Boolean);
+            const out = [];
+            let spent = 0;
+            for (const sec of sections) {
+              const trimmed = sec.length > perFileBudget
+                ? sec.slice(0, perFileBudget) + "\n... [file diff truncated]\n"
+                : sec;
+              if (spent + trimmed.length > totalBudget) {
+                out.push("\n... [remaining files omitted to stay within token budget]\n");
+                break;
+              }
+              out.push(trimmed);
+              spent += trimmed.length;
             }
+            return out.join("\n");
+          }
 
-            const body = JSON.stringify({
-              model: "claude-sonnet-4-20250514",
-              max_tokens: 1500,
-              messages: [
-                {
-                  role: "user",
-                  content: `You are a senior software engineer.\n\nReview this GitHub PR diff and provide concise, actionable feedback.\n\nPR DIFF:\n${diff}`
-                }
-              ]
-            });
-
-            const response = await fetch("https://api.anthropic.com/v1/messages", {
+          async function callClaude(prompt) {
+            const res = await fetch("https://api.anthropic.com/v1/messages", {
               method: "POST",
               headers: {
                 "x-api-key": process.env.ANTHROPIC_API_KEY,
                 "anthropic-version": "2023-06-01",
-                "content-type": "application/json"
+                "content-type": "application/json",
               },
-              body: body
+              body: JSON.stringify({
+                model: "claude-sonnet-4-20250514",
+                max_tokens: 1500,
+                messages: [{ role: "user", content: prompt }],
+              }),
             });
-
-            if (!response.ok) {
-              const errorText = await response.text();
-              throw new Error("Claude API error: " + errorText);
+            if (!res.ok) {
+              const err = await res.text();
+              throw new Error(`Claude API error ${res.status}: ${err}`);
             }
-
-            const data = await response.json();
-            const reviewText = data.content[0].text;
-            fs.writeFileSync("review.txt", reviewText);
+            const data = await res.json();
+            return data.content?.[0]?.text ?? "No response from Claude.";
           }
 
-          main().catch(err => {
-            console.error(err);
+          async function main() {
+            const mode = process.env.MODE;
+            let prompt;
+
+            if (mode === "comment") {
+              // Clamp comment to avoid runaway token use on large pasted blocks
+              const comment = (process.env.COMMENT_BODY || "").slice(0, 2000);
+              prompt = [
+                "You are a senior software engineer assisting inside a GitHub Pull Request.",
+                "",
+                "The developer mentioned you with this comment:",
+                comment,
+                "",
+                "Reply concisely. If asked for code, provide a clean snippet with a brief explanation.",
+                "Keep your response under 600 words.",
+              ].join("\n");
+
+            } else {
+              const raw = fs.existsSync("pr.diff")
+                ? fs.readFileSync("pr.diff", "utf8")
+                : "";
+              const diff = trimDiff(raw);
+
+              if (!diff.trim()) {
+                fs.writeFileSync("review.txt", "No reviewable changes detected in this PR.");
+                return;
+              }
+
+              const total    = process.env.TOTAL_FILES    || "?";
+              const reviewed = process.env.REVIEWED_FILES || "?";
+              const truncated = process.env.DIFF_TRUNCATED === "true";
+
+              const scopeLine = (total !== reviewed || truncated)
+                ? `Scope: ${total} files changed; reviewing ${reviewed}${truncated ? " (diff size-capped at 100 KB)" : ""}.\n`
+                : "";
+
+              prompt = [
+                "You are a senior software engineer doing a focused code review.",
+                scopeLine,
+                "Provide exactly these sections (skip a section if nothing to report):",
+                "- **Summary**: 1–2 sentences on what changed",
+                "- **Issues**: bugs or correctness problems",
+                "- **Suggestions**: up to 3 actionable improvements",
+                "- **Security**: any security concerns",
+                "",
+                "Rules: be concise, skip trivial style nits, focus on impact.",
+                "",
+                "DIFF:",
+                diff,
+              ].join("\n");
+            }
+
+            const text = await callClaude(prompt);
+            fs.writeFileSync("review.txt", text);
+          }
+
+          main().catch((e) => {
+            console.error(e.message);
             process.exit(1);
           });
-          EOF
+          SCRIPT
 
-      - name: Post Claude Review as PR Comment
+      - name: Run Claude
+        if: env.SKIP_REVIEW != 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MODE: ${{ env.MODE }}
+          # Passed via env (not shell echo) to safely handle special chars / newlines
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          TOTAL_FILES: ${{ env.TOTAL_FILES }}
+          REVIEWED_FILES: ${{ env.REVIEWED_FILES }}
+          DIFF_TRUNCATED: ${{ env.DIFF_TRUNCATED }}
+        run: node claude.js
+
+      - name: Post Claude Response
+        if: env.SKIP_REVIEW != 'true'
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.MY_PAT_TOKEN }}   # ✅ explicitly set token
+          github-token: ${{ secrets.MY_PAT_TOKEN }}
           script: |
             const fs = require('fs');
             const review = fs.readFileSync('review.txt', 'utf8');
+            const isComment = context.eventName === 'issue_comment';
+
+            const body = isComment
+              ? `> 🤖 **@claude response:**\n\n${review}`
+              : `## 🤖 Claude Code Review\n\n${review}`;
 
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: "## 🤖 Claude Code Review\n\n" + review
+              body,
             });
+
+      - name: Skip Notice
+        if: env.SKIP_REVIEW == 'true'
+        run: echo "All changed files were filtered out (lock files, generated code, etc). Skipping review."
