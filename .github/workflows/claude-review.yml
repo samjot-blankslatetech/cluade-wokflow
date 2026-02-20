@@ -44,14 +44,22 @@ jobs:
             echo "MODE=review" >> $GITHUB_ENV
           fi
 
-      # Build a token-efficient filtered diff (review mode only)
+      # Build a token-efficient filtered diff (both review and comment modes)
       - name: Build Filtered Diff
-        if: env.MODE == 'review'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git fetch origin ${{ github.base_ref }}
+          # issue_comment events don't expose github.base_ref — fetch it from API
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            BASE_REF=$(gh api repos/${{ github.repository }}/pulls/${{ github.event.issue.number }} --jq '.base.ref')
+          else
+            BASE_REF="${{ github.base_ref }}"
+          fi
+
+          git fetch origin "$BASE_REF"
 
           # All changed files
-          git diff --name-only origin/${{ github.base_ref }} > all_files.txt
+          git diff --name-only origin/"$BASE_REF" > all_files.txt
           TOTAL=$(wc -l < all_files.txt | tr -d ' ')
           echo "TOTAL_FILES=$TOTAL" >> $GITHUB_ENV
 
@@ -73,7 +81,7 @@ jobs:
 
           # Build diff only for selected files
           while IFS= read -r file; do
-            [ -f "$file" ] && git diff origin/${{ github.base_ref }} -- "$file" 2>/dev/null
+            [ -f "$file" ] && git diff origin/"$BASE_REF" -- "$file" 2>/dev/null
           done < review_files.txt > pr.diff
 
           # Hard cap at 100 KB — keeps prompt tokens reasonable for any PR size
@@ -136,13 +144,22 @@ jobs:
             if (mode === "comment") {
               // Clamp comment to avoid runaway token use on large pasted blocks
               const comment = (process.env.COMMENT_BODY || "").slice(0, 2000);
+
+              // Include the diff so Claude can answer questions like "give description"
+              const rawDiff = fs.existsSync("pr.diff") ? fs.readFileSync("pr.diff", "utf8") : "";
+              const diff = rawDiff ? trimDiff(rawDiff, 40000, 8000) : "";
+              const diffSection = diff
+                ? `\nHere are the PR changes for context:\n\`\`\`diff\n${diff}\n\`\`\`\n`
+                : "\n(No diff context available)\n";
+
               prompt = [
                 "You are a senior software engineer assisting inside a GitHub Pull Request.",
-                "",
-                "The developer mentioned you with this comment:",
+                diffSection,
+                "The developer asked:",
                 comment,
                 "",
-                "Reply concisely. If asked for code, provide a clean snippet with a brief explanation.",
+                "Reply concisely based on the PR changes above.",
+                "If asked for a description, write one based on what actually changed.",
                 "Keep your response under 600 words.",
               ].join("\n");
 
@@ -214,7 +231,7 @@ jobs:
             const isComment = context.eventName === 'issue_comment';
 
             const body = isComment
-              ? `> 🤖 **@claude response:**\n\n${review}`
+              ? `> 🤖 **Claude response:**\n\n${review}`
               : `## 🤖 Claude Code Review\n\n${review}`;
 
             await github.rest.issues.createComment({
